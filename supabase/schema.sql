@@ -1,7 +1,8 @@
 -- Boys at the Back - Database Schema
 -- Run this in Supabase SQL Editor
+-- Safe to re-run (uses drop policy if exists)
 
--- Profiles (extends auth.users)
+-- Profiles
 create table if not exists public.profiles (
   id uuid references auth.users on delete cascade primary key,
   username text unique not null,
@@ -11,25 +12,21 @@ create table if not exists public.profiles (
   updated_at timestamptz default now()
 );
 
--- Enable RLS
 alter table public.profiles enable row level security;
 
+drop policy if exists "Public profiles are viewable by authenticated users" on public.profiles;
 create policy "Public profiles are viewable by authenticated users"
-  on public.profiles for select
-  to authenticated
-  using (true);
+  on public.profiles for select to authenticated using (true);
 
+drop policy if exists "Users can update own profile" on public.profiles;
 create policy "Users can update own profile"
-  on public.profiles for update
-  to authenticated
-  using (auth.uid() = id);
+  on public.profiles for update to authenticated using (auth.uid() = id);
 
+drop policy if exists "Users can insert own profile" on public.profiles;
 create policy "Users can insert own profile"
-  on public.profiles for insert
-  to authenticated
-  with check (auth.uid() = id);
+  on public.profiles for insert to authenticated with check (auth.uid() = id);
 
--- The single private group (we only need one for the boys)
+-- Groups
 create table if not exists public.groups (
   id uuid primary key default gen_random_uuid(),
   name text not null default 'Boys at the Back',
@@ -39,6 +36,14 @@ create table if not exists public.groups (
 );
 
 alter table public.groups enable row level security;
+
+drop policy if exists "Authenticated users can view groups" on public.groups;
+create policy "Authenticated users can view groups"
+  on public.groups for select to authenticated using (true);
+
+drop policy if exists "Authenticated users can create groups" on public.groups;
+create policy "Authenticated users can create groups"
+  on public.groups for insert to authenticated with check (true);
 
 -- Group members
 create table if not exists public.group_members (
@@ -51,13 +56,14 @@ create table if not exists public.group_members (
 
 alter table public.group_members enable row level security;
 
-create policy "Members can see their groups"
-  on public.group_members for select
-  to authenticated
-  using (user_id = auth.uid() or exists (
-    select 1 from public.group_members gm
-    where gm.group_id = group_members.group_id and gm.user_id = auth.uid()
-  ));
+drop policy if exists "Members can see group members" on public.group_members;
+drop policy if exists "Members can see their groups" on public.group_members;
+create policy "Members can see group members"
+  on public.group_members for select to authenticated using (true);
+
+drop policy if exists "Users can join groups" on public.group_members;
+create policy "Users can join groups"
+  on public.group_members for insert to authenticated with check (auth.uid() = user_id);
 
 -- Channels
 create table if not exists public.channels (
@@ -70,6 +76,14 @@ create table if not exists public.channels (
 );
 
 alter table public.channels enable row level security;
+
+drop policy if exists "Authenticated can view channels" on public.channels;
+create policy "Authenticated can view channels"
+  on public.channels for select to authenticated using (true);
+
+drop policy if exists "Authenticated can create channels" on public.channels;
+create policy "Authenticated can create channels"
+  on public.channels for insert to authenticated with check (true);
 
 -- Messages
 create table if not exists public.messages (
@@ -84,7 +98,23 @@ create table if not exists public.messages (
 
 alter table public.messages enable row level security;
 
--- Message reactions
+drop policy if exists "Authenticated can view messages" on public.messages;
+create policy "Authenticated can view messages"
+  on public.messages for select to authenticated using (true);
+
+drop policy if exists "Users can send messages" on public.messages;
+create policy "Users can send messages"
+  on public.messages for insert to authenticated with check (auth.uid() = author_id);
+
+drop policy if exists "Users can update own messages" on public.messages;
+create policy "Users can update own messages"
+  on public.messages for update to authenticated using (auth.uid() = author_id);
+
+drop policy if exists "Users can delete own messages" on public.messages;
+create policy "Users can delete own messages"
+  on public.messages for delete to authenticated using (auth.uid() = author_id);
+
+-- Reactions
 create table if not exists public.reactions (
   message_id uuid references public.messages(id) on delete cascade,
   user_id uuid references public.profiles(id) on delete cascade,
@@ -95,30 +125,27 @@ create table if not exists public.reactions (
 
 alter table public.reactions enable row level security;
 
--- Direct messages (Phase 2)
-create table if not exists public.dm_conversations (
-  id uuid primary key default gen_random_uuid(),
-  created_at timestamptz default now()
-);
+drop policy if exists "Authenticated can view reactions" on public.reactions;
+create policy "Authenticated can view reactions"
+  on public.reactions for select to authenticated using (true);
 
-create table if not exists public.dm_participants (
-  conversation_id uuid references public.dm_conversations(id) on delete cascade,
-  user_id uuid references public.profiles(id) on delete cascade,
-  primary key (conversation_id, user_id)
-);
+drop policy if exists "Users can add reactions" on public.reactions;
+create policy "Users can add reactions"
+  on public.reactions for insert to authenticated with check (auth.uid() = user_id);
 
-create table if not exists public.dm_messages (
-  id uuid primary key default gen_random_uuid(),
-  conversation_id uuid references public.dm_conversations(id) on delete cascade,
-  author_id uuid references public.profiles(id) on delete set null,
-  content text,
-  created_at timestamptz default now()
-);
+drop policy if exists "Users can remove own reactions" on public.reactions;
+create policy "Users can remove own reactions"
+  on public.reactions for delete to authenticated using (auth.uid() = user_id);
 
--- Enable Realtime for messages
-alter publication supabase_realtime add table public.messages;
-alter publication supabase_realtime add table public.reactions;
-alter publication supabase_realtime add table public.profiles;
+-- Realtime
+do $$ begin
+  alter publication supabase_realtime add table public.messages;
+exception when duplicate_object then null; end $$;
 
--- Helper: create the initial group + default channels (run once after creating your first user)
--- You can run this manually later or we can add a setup function.
+do $$ begin
+  alter publication supabase_realtime add table public.reactions;
+exception when duplicate_object then null; end $$;
+
+do $$ begin
+  alter publication supabase_realtime add table public.profiles;
+exception when duplicate_object then null; end $$;
