@@ -22,7 +22,7 @@ interface Message {
   profiles?: {
     username: string
     avatar_url: string | null
-  }
+  } | null
 }
 
 interface Profile {
@@ -51,7 +51,7 @@ export default function AppLayout({ session }: Props) {
         .from('profiles')
         .select('*')
         .eq('id', session.user.id)
-        .single()
+        .maybeSingle()
 
       if (!existingProfile) {
         await supabase.from('profiles').upsert({
@@ -60,7 +60,6 @@ export default function AppLayout({ session }: Props) {
           status: 'online'
         })
       } else {
-        // Set online
         await supabase
           .from('profiles')
           .update({ status: 'online' })
@@ -73,7 +72,6 @@ export default function AppLayout({ session }: Props) {
       let groupId: string
 
       if (!groups || groups.length === 0) {
-        // Create the private group
         const inviteCode = Math.random().toString(36).substring(2, 10).toUpperCase()
         const { data: newGroup, error } = await supabase
           .from('groups')
@@ -93,14 +91,12 @@ export default function AppLayout({ session }: Props) {
 
         groupId = newGroup.id
 
-        // Add creator as owner
         await supabase.from('group_members').insert({
           group_id: groupId,
           user_id: session.user.id,
           role: 'owner'
         })
 
-        // Create default channels
         const defaultChannels = ['general', 'gaming', 'memes', 'music', 'random']
         await supabase.from('channels').insert(
           defaultChannels.map((name, i) => ({
@@ -113,13 +109,12 @@ export default function AppLayout({ session }: Props) {
       } else {
         groupId = groups[0].id
 
-        // Make sure current user is a member
         const { data: membership } = await supabase
           .from('group_members')
           .select('*')
           .eq('group_id', groupId)
           .eq('user_id', session.user.id)
-          .single()
+          .maybeSingle()
 
         if (!membership) {
           await supabase.from('group_members').insert({
@@ -161,7 +156,6 @@ export default function AppLayout({ session }: Props) {
 
     init()
 
-    // Set offline on leave
     return () => {
       supabase
         .from('profiles')
@@ -176,25 +170,36 @@ export default function AppLayout({ session }: Props) {
     if (!activeChannelId) return
 
     async function loadMessages() {
-      const { data } = await supabase
+      const { data, error } = await supabase
         .from('messages')
         .select(`
           id,
           content,
           author_id,
           created_at,
-          profiles (username, avatar_url)
+          profiles!author_id (username, avatar_url)
         `)
         .eq('channel_id', activeChannelId)
         .order('created_at', { ascending: true })
         .limit(100)
 
-      if (data) setMessages(data as any)
+      if (error) {
+        console.error('Load messages error:', error)
+        // Fallback without join
+        const { data: simple } = await supabase
+          .from('messages')
+          .select('id, content, author_id, created_at')
+          .eq('channel_id', activeChannelId)
+          .order('created_at', { ascending: true })
+          .limit(100)
+        if (simple) setMessages(simple as any)
+      } else if (data) {
+        setMessages(data as any)
+      }
     }
 
     loadMessages()
 
-    // Realtime subscription
     const channel = supabase
       .channel(`messages:${activeChannelId}`)
       .on(
@@ -206,25 +211,29 @@ export default function AppLayout({ session }: Props) {
           filter: `channel_id=eq.${activeChannelId}`
         },
         async (payload) => {
-          // Fetch the full message with profile
-          const { data } = await supabase
-            .from('messages')
-            .select(`
-              id,
-              content,
-              author_id,
-              created_at,
-              profiles (username, avatar_url)
-            `)
-            .eq('id', payload.new.id)
-            .single()
+          const newMsg = payload.new as any
 
-          if (data) {
-            setMessages(prev => {
-              if (prev.some(m => m.id === data.id)) return prev
-              return [...prev, data as any]
-            })
+          // Try to get profile
+          let profile = null
+          if (newMsg.author_id) {
+            const { data: p } = await supabase
+              .from('profiles')
+              .select('username, avatar_url')
+              .eq('id', newMsg.author_id)
+              .maybeSingle()
+            profile = p
           }
+
+          setMessages(prev => {
+            if (prev.some(m => m.id === newMsg.id)) return prev
+            return [...prev, {
+              id: newMsg.id,
+              content: newMsg.content,
+              author_id: newMsg.author_id,
+              created_at: newMsg.created_at,
+              profiles: profile
+            }]
+          })
         }
       )
       .subscribe()
@@ -234,7 +243,6 @@ export default function AppLayout({ session }: Props) {
     }
   }, [activeChannelId])
 
-  // Auto scroll
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' })
   }, [messages])
@@ -247,16 +255,41 @@ export default function AppLayout({ session }: Props) {
     const content = newMessage.trim()
     setNewMessage('')
 
-    const { error } = await supabase.from('messages').insert({
-      channel_id: activeChannelId,
+    // Optimistic update so it appears immediately
+    const tempId = 'temp-' + Date.now()
+    const optimisticMsg: Message = {
+      id: tempId,
+      content,
       author_id: session.user.id,
-      content
-    })
+      created_at: new Date().toISOString(),
+      profiles: { username, avatar_url: null }
+    }
+    setMessages(prev => [...prev, optimisticMsg])
+
+    const { data, error } = await supabase
+      .from('messages')
+      .insert({
+        channel_id: activeChannelId,
+        author_id: session.user.id,
+        content
+      })
+      .select('id, content, author_id, created_at')
+      .single()
 
     if (error) {
-      console.error(error)
-      setNewMessage(content) // restore on error
+      console.error('Send error:', error)
+      // Remove optimistic message on error
+      setMessages(prev => prev.filter(m => m.id !== tempId))
+      setNewMessage(content)
+    } else if (data) {
+      // Replace temp message with real one
+      setMessages(prev => prev.map(m =>
+        m.id === tempId
+          ? { ...data, profiles: { username, avatar_url: null } }
+          : m
+      ))
     }
+
     setSending(false)
   }
 
@@ -360,11 +393,11 @@ export default function AppLayout({ session }: Props) {
           {messages.map((msg) => (
             <div key={msg.id} className="flex gap-3 mb-4 group">
               <div className="w-9 h-9 rounded-full bg-bat-accent/20 flex items-center justify-center text-bat-accent font-medium text-sm flex-shrink-0">
-                {(msg.profiles?.username || '?')[0].toUpperCase()}
+                {(msg.profiles?.username || username || '?')[0].toUpperCase()}
               </div>
               <div className="min-w-0">
                 <div className="flex items-baseline gap-2">
-                  <span className="font-medium text-sm">{msg.profiles?.username || 'Unknown'}</span>
+                  <span className="font-medium text-sm">{msg.profiles?.username || username}</span>
                   <span className="text-xs text-bat-muted">
                     {format(new Date(msg.created_at), 'MMM d, h:mm a')}
                   </span>
