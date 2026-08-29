@@ -1,0 +1,277 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Boys at the Back</title>
+  <script src="https://unpkg.com/peerjs@1.5.4/dist/peerjs.min.js"></script>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: system-ui, -apple-system, sans-serif;
+      background: #0f0f0f;
+      color: #e0e0e0;
+      height: 100vh;
+      display: flex;
+      flex-direction: column;
+    }
+    header {
+      background: #1a1a1a;
+      padding: 12px 16px;
+      border-bottom: 1px solid #333;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+    }
+    #room-info { font-size: 14px; color: #aaa; }
+    #status { font-size: 13px; color: #4ade80; }
+    #chat {
+      flex: 1;
+      overflow-y: auto;
+      padding: 16px;
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+    }
+    .msg {
+      max-width: 80%;
+      padding: 8px 12px;
+      border-radius: 12px;
+      line-height: 1.4;
+      word-break: break-word;
+    }
+    .msg.me {
+      background: #2563eb;
+      align-self: flex-end;
+      border-bottom-right-radius: 4px;
+    }
+    .msg.other {
+      background: #2a2a2a;
+      align-self: flex-start;
+      border-bottom-left-radius: 4px;
+    }
+    .msg .name {
+      font-size: 12px;
+      color: #93c5fd;
+      margin-bottom: 2px;
+    }
+    .system {
+      text-align: center;
+      color: #666;
+      font-size: 13px;
+      margin: 8px 0;
+    }
+    #input-area {
+      display: flex;
+      gap: 8px;
+      padding: 12px;
+      background: #1a1a1a;
+      border-top: 1px solid #333;
+    }
+    #message {
+      flex: 1;
+      padding: 10px 14px;
+      border: none;
+      border-radius: 20px;
+      background: #2a2a2a;
+      color: white;
+      font-size: 15px;
+      outline: none;
+    }
+    #send {
+      padding: 10px 18px;
+      border: none;
+      border-radius: 20px;
+      background: #2563eb;
+      color: white;
+      font-weight: 600;
+      cursor: pointer;
+    }
+    #send:disabled { opacity: 0.5; cursor: not-allowed; }
+    #setup {
+      position: fixed;
+      inset: 0;
+      background: #0f0f0f;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      gap: 16px;
+      padding: 20px;
+      z-index: 10;
+    }
+    #setup input, #setup button {
+      width: 100%;
+      max-width: 280px;
+      padding: 12px;
+      border-radius: 8px;
+      border: none;
+      font-size: 16px;
+    }
+    #setup input {
+      background: #2a2a2a;
+      color: white;
+    }
+    #setup button {
+      background: #2563eb;
+      color: white;
+      font-weight: 600;
+      cursor: pointer;
+    }
+    .hidden { display: none !important; }
+  </style>
+</head>
+<body>
+  <div id="setup">
+    <h2 style="margin-bottom: 8px;">Boys at the Back</h2>
+    <input id="name" placeholder="Your name" maxlength="20">
+    <input id="room" placeholder="Room ID (or leave empty to create)">
+    <button id="join-btn">Join / Create Room</button>
+  </div>
+
+  <header class="hidden" id="header">
+    <div>
+      <strong>Boys at the Back</strong>
+      <div id="room-info"></div>
+    </div>
+    <div id="status">Connecting...</div>
+  </header>
+
+  <div id="chat" class="hidden"></div>
+
+  <div id="input-area" class="hidden">
+    <input id="message" placeholder="Type a message..." autocomplete="off">
+    <button id="send" disabled>Send</button>
+  </div>
+
+  <script>
+    const setup = document.getElementById('setup');
+    const header = document.getElementById('header');
+    const chat = document.getElementById('chat');
+    const inputArea = document.getElementById('input-area');
+    const messageInput = document.getElementById('message');
+    const sendBtn = document.getElementById('send');
+    const status = document.getElementById('status');
+    const roomInfo = document.getElementById('room-info');
+
+    let peer, connections = {}, myName = '', roomId = '';
+
+    function addMessage(text, type = 'system', from = '') {
+      const div = document.createElement('div');
+      if (type === 'system') {
+        div.className = 'system';
+        div.textContent = text;
+      } else {
+        div.className = `msg ${type}`;
+        if (from) {
+          const name = document.createElement('div');
+          name.className = 'name';
+          name.textContent = from;
+          div.appendChild(name);
+        }
+        const content = document.createElement('div');
+        content.textContent = text;
+        div.appendChild(content);
+      }
+      chat.appendChild(div);
+      chat.scrollTop = chat.scrollHeight;
+    }
+
+    function broadcast(data) {
+      Object.values(connections).forEach(conn => {
+        if (conn.open) conn.send(data);
+      });
+    }
+
+    function connectToPeer(id) {
+      if (connections[id] || id === peer.id) return;
+      const conn = peer.connect(id, { reliable: true });
+      setupConnection(conn);
+    }
+
+    function setupConnection(conn) {
+      connections[conn.peer] = conn;
+
+      conn.on('open', () => {
+        conn.send({ type: 'hello', name: myName });
+        status.textContent = `${Object.keys(connections).length} online`;
+      });
+
+      conn.on('data', data => {
+        if (data.type === 'hello') {
+          addMessage(`${data.name} joined`, 'system');
+          status.textContent = `${Object.keys(connections).length} online`;
+        } else if (data.type === 'msg') {
+          addMessage(data.text, 'other', data.name);
+        } else if (data.type === 'peers') {
+          data.list.forEach(id => connectToPeer(id));
+        }
+      });
+
+      conn.on('close', () => {
+        delete connections[conn.peer];
+        status.textContent = `${Object.keys(connections).length} online`;
+        addMessage('Someone left', 'system');
+      });
+    }
+
+    document.getElementById('join-btn').onclick = () => {
+      myName = document.getElementById('name').value.trim() || 'Anon';
+      roomId = document.getElementById('room').value.trim() || Math.random().toString(36).substring(2, 8);
+
+      peer = new Peer(roomId + '-' + Math.random().toString(36).substring(2, 6));
+
+      peer.on('open', id => {
+        setup.classList.add('hidden');
+        header.classList.remove('hidden');
+        chat.classList.remove('hidden');
+        inputArea.classList.remove('hidden');
+        roomInfo.textContent = `Room: ${roomId}`;
+        status.textContent = 'Connected';
+        addMessage(`You joined as ${myName}`, 'system');
+        addMessage(`Share room ID: ${roomId}`, 'system');
+
+        // Try to connect to the "host" of the room
+        const hostId = roomId + '-host';
+        if (!id.endsWith('-host')) {
+          connectToPeer(hostId);
+        }
+      });
+
+      peer.on('connection', conn => {
+        setupConnection(conn);
+        // Tell new peer about existing peers
+        setTimeout(() => {
+          conn.send({
+            type: 'peers',
+            list: Object.keys(connections)
+          });
+        }, 300);
+      });
+
+      peer.on('error', err => {
+        console.error(err);
+        status.textContent = 'Error - try different room ID';
+      });
+    };
+
+    function sendMessage() {
+      const text = messageInput.value.trim();
+      if (!text) return;
+      addMessage(text, 'me', myName);
+      broadcast({ type: 'msg', text, name: myName });
+      messageInput.value = '';
+    }
+
+    sendBtn.onclick = sendMessage;
+    messageInput.onkeydown = e => {
+      if (e.key === 'Enter') sendMessage();
+    };
+
+    // Enable send button once connected
+    setInterval(() => {
+      sendBtn.disabled = Object.keys(connections).length === 0 && !peer;
+    }, 500);
+  </script>
+</body>
+</html>
