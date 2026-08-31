@@ -5,12 +5,17 @@
 -- Profiles
 create table if not exists public.profiles (
   id uuid references auth.users on delete cascade primary key,
-  username text unique not null,
+  username text unique,
   avatar_url text,
-  status text default 'offline' check (status in ('online', 'idle', 'dnd', 'offline')),
+  status text default 'offline',
   created_at timestamptz default now(),
   updated_at timestamptz default now()
 );
+
+-- Add missing columns if table already existed from another project
+alter table public.profiles add column if not exists username text;
+alter table public.profiles add column if not exists avatar_url text;
+alter table public.profiles add column if not exists status text default 'offline';
 
 alter table public.profiles enable row level security;
 
@@ -91,10 +96,14 @@ create table if not exists public.messages (
   channel_id uuid references public.channels(id) on delete cascade not null,
   author_id uuid references public.profiles(id) on delete set null,
   content text,
+  image_url text,
   reply_to uuid references public.messages(id) on delete set null,
   edited_at timestamptz,
   created_at timestamptz default now()
 );
+
+-- Add image_url if messages table already existed
+alter table public.messages add column if not exists image_url text;
 
 alter table public.messages enable row level security;
 
@@ -149,3 +158,22 @@ exception when duplicate_object then null; end $$;
 do $$ begin
   alter publication supabase_realtime add table public.profiles;
 exception when duplicate_object then null; end $$;
+
+-- Storage bucket for chat images (run once)
+insert into storage.buckets (id, name, public)
+values ('chat-images', 'chat-images', true)
+on conflict (id) do nothing;
+
+drop policy if exists "Anyone can view chat images" on storage.objects;
+create policy "Anyone can view chat images"
+  on storage.objects for select using (bucket_id = 'chat-images');
+
+drop policy if exists "Authenticated can upload chat images" on storage.objects;
+create policy "Authenticated can upload chat images"
+  on storage.objects for insert to authenticated
+  with check (bucket_id = 'chat-images');
+
+drop policy if exists "Users can delete own chat images" on storage.objects;
+create policy "Users can delete own chat images"
+  on storage.objects for delete to authenticated
+  using (bucket_id = 'chat-images' and auth.uid()::text = (storage.foldername(name))[1]);
