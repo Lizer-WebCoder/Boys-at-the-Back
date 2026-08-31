@@ -1,6 +1,6 @@
 import { Session } from '@supabase/supabase-js'
-import { useState, useEffect, useRef } from 'react'
-import { Hash, Users, LogOut, Mic, Send, Pencil, Trash2, Reply, X, Copy, Check } from 'lucide-react'
+import { useState, useEffect, useRef, useCallback } from 'react'
+import { Hash, Users, LogOut, Mic, Send, Pencil, Trash2, Reply, X, Copy, Check, Smile } from 'lucide-react'
 import { supabase } from '../lib/supabase'
 import { format } from 'date-fns'
 
@@ -14,6 +14,13 @@ interface Channel {
   type: string
 }
 
+interface Reaction {
+  emoji: string
+  user_id: string
+  count?: number
+  users?: string[]
+}
+
 interface Message {
   id: string
   content: string
@@ -23,6 +30,7 @@ interface Message {
   reply_to?: string | null
   profiles?: { username: string; avatar_url: string | null } | null
   reply_message?: { id: string; content: string; profiles?: { username: string } | null } | null
+  reactions?: Reaction[]
 }
 
 interface Profile {
@@ -31,6 +39,8 @@ interface Profile {
   avatar_url: string | null
   status: string
 }
+
+const QUICK_EMOJIS = ['👍', '❤️', '😂', '🔥', '👀', '🎉']
 
 export default function AppLayout({ session }: Props) {
   const [channels, setChannels] = useState<Channel[]>([])
@@ -50,24 +60,22 @@ export default function AppLayout({ session }: Props) {
   const [joinError, setJoinError] = useState('')
   const [joining, setJoining] = useState(false)
   const [copied, setCopied] = useState(false)
+  const [typingUsers, setTypingUsers] = useState<string[]>([])
+  const [showEmojiFor, setShowEmojiFor] = useState<string | null>(null)
   const messagesEndRef = useRef<HTMLDivElement>(null)
   const inputRef = useRef<HTMLInputElement>(null)
+  const typingTimeout = useRef<ReturnType<typeof setTimeout> | null>(null)
   const username = session.user.user_metadata?.username || 'User'
 
   const loadGroupData = async (gId: string) => {
     setGroupId(gId)
-
     const { data: group } = await supabase.from('groups').select('invite_code').eq('id', gId).single()
     if (group) setInviteCode(group.invite_code)
 
     const { data: channelData } = await supabase
-      .from('channels')
-      .select('*')
-      .eq('group_id', gId)
-      .eq('type', 'text')
-      .order('position')
+      .from('channels').select('*').eq('group_id', gId).eq('type', 'text').order('position')
 
-    if (channelData && channelData.length > 0) {
+    if (channelData?.length) {
       setChannels(channelData)
       setActiveChannelId(channelData[0].id)
     }
@@ -78,91 +86,55 @@ export default function AppLayout({ session }: Props) {
       .eq('group_id', gId)
 
     if (memberData) {
-      const profiles = memberData.map((m: any) => m.profiles).filter(Boolean) as Profile[]
-      setMembers(profiles)
+      setMembers(memberData.map((m: any) => m.profiles).filter(Boolean) as Profile[])
     }
   }
 
   useEffect(() => {
     async function init() {
-      // Ensure profile
       const { data: existingProfile } = await supabase
-        .from('profiles')
-        .select('*')
-        .eq('id', session.user.id)
-        .maybeSingle()
+        .from('profiles').select('*').eq('id', session.user.id).maybeSingle()
 
       if (!existingProfile) {
-        await supabase.from('profiles').upsert({
-          id: session.user.id,
-          username,
-          status: 'online'
-        })
+        await supabase.from('profiles').upsert({ id: session.user.id, username, status: 'online' })
       } else {
         await supabase.from('profiles').update({ status: 'online' }).eq('id', session.user.id)
       }
 
-      // Check groups
       const { data: groups } = await supabase.from('groups').select('*').limit(1)
 
-      if (!groups || groups.length === 0) {
-        // First user creates the group
+      if (!groups?.length) {
         const code = Math.random().toString(36).substring(2, 10).toUpperCase()
         const { data: newGroup, error } = await supabase
           .from('groups')
           .insert({ name: 'Boys at the Back', invite_code: code, created_by: session.user.id })
-          .select()
-          .single()
+          .select().single()
 
-        if (error || !newGroup) {
-          console.error(error)
-          setLoading(false)
-          return
-        }
+        if (error || !newGroup) { console.error(error); setLoading(false); return }
 
-        await supabase.from('group_members').insert({
-          group_id: newGroup.id,
-          user_id: session.user.id,
-          role: 'owner'
-        })
-
+        await supabase.from('group_members').insert({ group_id: newGroup.id, user_id: session.user.id, role: 'owner' })
         const defaultChannels = ['general', 'gaming', 'memes', 'music', 'random']
         await supabase.from('channels').insert(
-          defaultChannels.map((name, i) => ({
-            group_id: newGroup.id,
-            name,
-            type: 'text',
-            position: i
-          }))
+          defaultChannels.map((name, i) => ({ group_id: newGroup.id, name, type: 'text', position: i }))
         )
-
         await loadGroupData(newGroup.id)
         setNeedsInvite(false)
       } else {
         const gId = groups[0].id
-
-        // Check membership
         const { data: membership } = await supabase
-          .from('group_members')
-          .select('*')
-          .eq('group_id', gId)
-          .eq('user_id', session.user.id)
-          .maybeSingle()
+          .from('group_members').select('*').eq('group_id', gId).eq('user_id', session.user.id).maybeSingle()
 
         if (membership) {
           await loadGroupData(gId)
           setNeedsInvite(false)
         } else {
-          // Not a member → need invite code
           setGroupId(gId)
           setInviteCode(groups[0].invite_code)
           setNeedsInvite(true)
         }
       }
-
       setLoading(false)
     }
-
     init()
     return () => {
       supabase.from('profiles').update({ status: 'offline' }).eq('id', session.user.id).then()
@@ -172,35 +144,20 @@ export default function AppLayout({ session }: Props) {
   const handleJoin = async (e: React.FormEvent) => {
     e.preventDefault()
     if (!joinCode.trim() || !groupId) return
-
     setJoining(true)
     setJoinError('')
 
-    // Verify code
-    const { data: group } = await supabase
-      .from('groups')
-      .select('id, invite_code')
-      .eq('id', groupId)
-      .single()
-
+    const { data: group } = await supabase.from('groups').select('id, invite_code').eq('id', groupId).single()
     if (!group || group.invite_code.toUpperCase() !== joinCode.trim().toUpperCase()) {
       setJoinError('Invalid invite code')
       setJoining(false)
       return
     }
 
-    // Join
     const { error } = await supabase.from('group_members').insert({
-      group_id: groupId,
-      user_id: session.user.id,
-      role: 'member'
+      group_id: groupId, user_id: session.user.id, role: 'member'
     })
-
-    if (error) {
-      setJoinError(error.message)
-      setJoining(false)
-      return
-    }
+    if (error) { setJoinError(error.message); setJoining(false); return }
 
     await loadGroupData(groupId)
     setNeedsInvite(false)
@@ -213,7 +170,29 @@ export default function AppLayout({ session }: Props) {
     setTimeout(() => setCopied(false), 2000)
   }
 
-  // Messages loading (same as before)
+  const loadReactions = async (messageIds: string[]) => {
+    if (!messageIds.length) return {}
+    const { data } = await supabase
+      .from('reactions')
+      .select('message_id, emoji, user_id')
+      .in('message_id', messageIds)
+
+    const map: Record<string, Reaction[]> = {}
+    if (data) {
+      data.forEach((r: any) => {
+        if (!map[r.message_id]) map[r.message_id] = []
+        const existing = map[r.message_id].find(x => x.emoji === r.emoji)
+        if (existing) {
+          existing.count = (existing.count || 1) + 1
+          existing.users = [...(existing.users || []), r.user_id]
+        } else {
+          map[r.message_id].push({ emoji: r.emoji, user_id: r.user_id, count: 1, users: [r.user_id] })
+        }
+      })
+    }
+    return map
+  }
+
   useEffect(() => {
     if (!activeChannelId || needsInvite) return
 
@@ -227,36 +206,34 @@ export default function AppLayout({ session }: Props) {
 
       if (error) {
         const { data: simple } = await supabase
-          .from('messages')
-          .select('id, content, author_id, created_at, edited_at, reply_to')
-          .eq('channel_id', activeChannelId)
-          .order('created_at', { ascending: true })
-          .limit(150)
+          .from('messages').select('id, content, author_id, created_at, edited_at, reply_to')
+          .eq('channel_id', activeChannelId).order('created_at', { ascending: true }).limit(150)
         if (simple) setMessages(simple as any)
-      } else if (data) {
+        return
+      }
+
+      if (data) {
         const withReplies = await Promise.all(
           (data as any[]).map(async (msg) => {
             if (!msg.reply_to) return msg
             const { data: replied } = await supabase
               .from('messages')
               .select('id, content, profiles!author_id (username)')
-              .eq('id', msg.reply_to)
-              .maybeSingle()
+              .eq('id', msg.reply_to).maybeSingle()
             return { ...msg, reply_message: replied }
           })
         )
-        setMessages(withReplies)
+        const reactionMap = await loadReactions(withReplies.map(m => m.id))
+        setMessages(withReplies.map(m => ({ ...m, reactions: reactionMap[m.id] || [] })))
       }
     }
 
     loadMessages()
 
-    const channel = supabase
+    const msgChannel = supabase
       .channel(`messages:${activeChannelId}`)
       .on('postgres_changes', {
-        event: '*',
-        schema: 'public',
-        table: 'messages',
+        event: '*', schema: 'public', table: 'messages',
         filter: `channel_id=eq.${activeChannelId}`
       }, async (payload) => {
         if (payload.eventType === 'INSERT') {
@@ -269,15 +246,12 @@ export default function AppLayout({ session }: Props) {
           let reply_message = null
           if (newMsg.reply_to) {
             const { data: replied } = await supabase
-              .from('messages')
-              .select('id, content, profiles!author_id (username)')
-              .eq('id', newMsg.reply_to)
-              .maybeSingle()
+              .from('messages').select('id, content, profiles!author_id (username)').eq('id', newMsg.reply_to).maybeSingle()
             reply_message = replied
           }
           setMessages(prev => {
             if (prev.some(m => m.id === newMsg.id)) return prev
-            return [...prev, { ...newMsg, profiles: profile, reply_message }]
+            return [...prev, { ...newMsg, profiles: profile, reply_message, reactions: [] }]
           })
         } else if (payload.eventType === 'UPDATE') {
           setMessages(prev => prev.map(m => m.id === payload.new.id ? { ...m, ...payload.new } : m))
@@ -287,12 +261,101 @@ export default function AppLayout({ session }: Props) {
       })
       .subscribe()
 
-    return () => { supabase.removeChannel(channel) }
+    const reactChannel = supabase
+      .channel(`reactions:${activeChannelId}`)
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'reactions' }, async () => {
+        setMessages(prev => {
+          const ids = prev.map(m => m.id).filter(id => !id.startsWith('temp-'))
+          loadReactions(ids).then(map => {
+            setMessages(curr => curr.map(m => ({ ...m, reactions: map[m.id] || [] })))
+          })
+          return prev
+        })
+      })
+      .subscribe()
+
+    const typingChannel = supabase.channel(`typing:${activeChannelId}`)
+      .on('broadcast', { event: 'typing' }, ({ payload }) => {
+        if (payload.userId === session.user.id) return
+        setTypingUsers(prev => {
+          if (prev.includes(payload.username)) return prev
+          return [...prev, payload.username]
+        })
+        setTimeout(() => {
+          setTypingUsers(prev => prev.filter(u => u !== payload.username))
+        }, 3000)
+      })
+      .subscribe()
+
+    return () => {
+      supabase.removeChannel(msgChannel)
+      supabase.removeChannel(reactChannel)
+      supabase.removeChannel(typingChannel)
+    }
   }, [activeChannelId, needsInvite])
 
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' })
-  }, [messages])
+  }, [messages, typingUsers])
+
+  const broadcastTyping = useCallback(() => {
+    if (!activeChannelId) return
+    supabase.channel(`typing:${activeChannelId}`).send({
+      type: 'broadcast',
+      event: 'typing',
+      payload: { userId: session.user.id, username }
+    })
+  }, [activeChannelId, session.user.id, username])
+
+  const handleInputChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+    setNewMessage(e.target.value)
+    if (typingTimeout.current) clearTimeout(typingTimeout.current)
+    broadcastTyping()
+    typingTimeout.current = setTimeout(() => {}, 2000)
+  }
+
+  const toggleReaction = async (messageId: string, emoji: string) => {
+    if (messageId.startsWith('temp-')) return
+    setShowEmojiFor(null)
+
+    const { data: existing } = await supabase
+      .from('reactions')
+      .select('*')
+      .eq('message_id', messageId)
+      .eq('user_id', session.user.id)
+      .eq('emoji', emoji)
+      .maybeSingle()
+
+    if (existing) {
+      await supabase.from('reactions').delete()
+        .eq('message_id', messageId).eq('user_id', session.user.id).eq('emoji', emoji)
+    } else {
+      await supabase.from('reactions').insert({
+        message_id: messageId, user_id: session.user.id, emoji
+      })
+    }
+
+    setMessages(prev => prev.map(m => {
+      if (m.id !== messageId) return m
+      const reactions = [...(m.reactions || [])]
+      const idx = reactions.findIndex(r => r.emoji === emoji)
+      if (existing) {
+        if (idx >= 0) {
+          reactions[idx].count = (reactions[idx].count || 1) - 1
+          reactions[idx].users = (reactions[idx].users || []).filter(u => u !== session.user.id)
+          if ((reactions[idx].count || 0) <= 0) reactions.splice(idx, 1)
+        }
+      } else {
+        if (idx >= 0) {
+          reactions[idx].count = (reactions[idx].count || 1) + 1
+          reactions[idx].users = [...(reactions[idx].users || []), session.user.id]
+        } else {
+          reactions.push({ emoji, user_id: session.user.id, count: 1, users: [session.user.id] })
+        }
+      }
+      return { ...m, reactions }
+    }))
+  }
 
   const sendMessage = async (e?: React.FormEvent) => {
     e?.preventDefault()
@@ -306,26 +369,26 @@ export default function AppLayout({ session }: Props) {
 
     const tempId = 'temp-' + Date.now()
     setMessages(prev => [...prev, {
-      id: tempId,
-      content,
-      author_id: session.user.id,
+      id: tempId, content, author_id: session.user.id,
       created_at: new Date().toISOString(),
       profiles: { username, avatar_url: null },
       reply_to: replyId,
-      reply_message: replyingTo ? { id: replyingTo.id, content: replyingTo.content, profiles: replyingTo.profiles } : null
+      reply_message: replyingTo ? { id: replyingTo.id, content: replyingTo.content, profiles: replyingTo.profiles } : null,
+      reactions: []
     }])
 
     const { data, error } = await supabase
       .from('messages')
       .insert({ channel_id: activeChannelId, author_id: session.user.id, content, reply_to: replyId })
-      .select('id, content, author_id, created_at, reply_to')
-      .single()
+      .select('id, content, author_id, created_at, reply_to').single()
 
     if (error) {
       setMessages(prev => prev.filter(m => m.id !== tempId))
       setNewMessage(content)
     } else if (data) {
-      setMessages(prev => prev.map(m => m.id === tempId ? { ...data, profiles: { username, avatar_url: null }, reply_message: replyingTo ? { id: replyingTo.id, content: replyingTo.content, profiles: replyingTo.profiles } : null } : m))
+      setMessages(prev => prev.map(m => m.id === tempId
+        ? { ...data, profiles: { username, avatar_url: null }, reply_message: replyingTo ? { id: replyingTo.id, content: replyingTo.content, profiles: replyingTo.profiles } : null, reactions: [] }
+        : m))
     }
     setSending(false)
   }
@@ -335,7 +398,8 @@ export default function AppLayout({ session }: Props) {
 
   const saveEdit = async (id: string) => {
     if (!editContent.trim()) return
-    const { error } = await supabase.from('messages').update({ content: editContent.trim(), edited_at: new Date().toISOString() }).eq('id', id)
+    const { error } = await supabase.from('messages')
+      .update({ content: editContent.trim(), edited_at: new Date().toISOString() }).eq('id', id)
     if (!error) {
       setMessages(prev => prev.map(m => m.id === id ? { ...m, content: editContent.trim(), edited_at: new Date().toISOString() } : m))
       cancelEdit()
@@ -365,36 +429,27 @@ export default function AppLayout({ session }: Props) {
     )
   }
 
-  // Invite gate for new users
   if (needsInvite) {
     return (
       <div className="h-full flex items-center justify-center bg-bat-bg p-4">
         <div className="w-full max-w-sm bg-bat-surface border border-bat-border rounded-2xl p-8">
           <h2 className="text-xl font-bold text-bat-accent text-center mb-2">Boys at the Back</h2>
           <p className="text-bat-muted text-center text-sm mb-6">Enter the invite code to join the boys</p>
-
           <form onSubmit={handleJoin} className="space-y-4">
             <input
-              type="text"
-              value={joinCode}
+              type="text" value={joinCode}
               onChange={e => setJoinCode(e.target.value.toUpperCase())}
               placeholder="INVITE CODE"
               className="w-full px-4 py-3 rounded-lg bg-bat-elevated border border-bat-border text-center text-lg tracking-widest font-mono outline-none focus:border-bat-accent"
               autoFocus
             />
             {joinError && <p className="text-bat-danger text-sm text-center">{joinError}</p>}
-            <button
-              type="submit"
-              disabled={joining || !joinCode.trim()}
-              className="w-full py-2.5 rounded-lg bg-bat-accent hover:bg-bat-accentHover text-black font-semibold disabled:opacity-50"
-            >
+            <button type="submit" disabled={joining || !joinCode.trim()}
+              className="w-full py-2.5 rounded-lg bg-bat-accent hover:bg-bat-accentHover text-black font-semibold disabled:opacity-50">
               {joining ? 'Joining...' : 'Join'}
             </button>
           </form>
-
-          <button onClick={handleLogout} className="w-full mt-4 text-sm text-bat-muted hover:text-bat-text">
-            Log out
-          </button>
+          <button onClick={handleLogout} className="w-full mt-4 text-sm text-bat-muted hover:text-bat-text">Log out</button>
         </div>
       </div>
     )
@@ -402,13 +457,11 @@ export default function AppLayout({ session }: Props) {
 
   return (
     <div className="h-full flex bg-bat-bg text-bat-text">
-      {/* Far left */}
       <div className="w-16 bg-bat-bg border-r border-bat-border flex flex-col items-center py-3 gap-2">
         <div className="w-11 h-11 rounded-2xl bg-bat-accent flex items-center justify-center text-black font-bold text-lg shadow-lg">B</div>
         <div className="w-8 h-0.5 bg-bat-border rounded-full my-1" />
       </div>
 
-      {/* Channels */}
       <div className="w-56 bg-bat-surface flex flex-col">
         <div className="h-12 px-4 flex items-center border-b border-bat-border shadow-sm">
           <h2 className="font-semibold text-sm tracking-wide">Boys at the Back</h2>
@@ -417,15 +470,12 @@ export default function AppLayout({ session }: Props) {
         <div className="flex-1 overflow-y-auto p-2">
           <div className="text-xs font-semibold text-bat-muted uppercase px-2 mb-1 tracking-wider">Text Channels</div>
           {channels.map(ch => (
-            <button
-              key={ch.id}
-              onClick={() => { setActiveChannelId(ch.id); setReplyingTo(null); setEditingId(null) }}
+            <button key={ch.id}
+              onClick={() => { setActiveChannelId(ch.id); setReplyingTo(null); setEditingId(null); setShowEmojiFor(null) }}
               className={`w-full flex items-center gap-2 px-2 py-1.5 rounded-md text-sm transition ${
                 activeChannelId === ch.id ? 'bg-bat-elevated text-bat-text' : 'text-bat-muted hover:bg-bat-elevated/60 hover:text-bat-text'
-              }`}
-            >
-              <Hash size={16} className="opacity-70" />
-              {ch.name}
+              }`}>
+              <Hash size={16} className="opacity-70" />{ch.name}
             </button>
           ))}
 
@@ -434,7 +484,6 @@ export default function AppLayout({ session }: Props) {
             <Mic size={16} /> Lounge
           </div>
 
-          {/* Invite code */}
           <div className="mt-6 px-2">
             <div className="text-xs font-semibold text-bat-muted uppercase mb-1 tracking-wider">Invite Code</div>
             <div className="flex items-center gap-1 bg-bat-elevated rounded-lg px-2 py-1.5">
@@ -463,14 +512,13 @@ export default function AppLayout({ session }: Props) {
         </div>
       </div>
 
-      {/* Main chat - same as before */}
       <div className="flex-1 flex flex-col min-w-0">
         <div className="h-12 px-4 flex items-center border-b border-bat-border shadow-sm">
           <Hash size={18} className="text-bat-muted mr-2" />
           <span className="font-semibold">{activeChannel?.name || 'general'}</span>
         </div>
 
-        <div className="flex-1 overflow-y-auto p-4">
+        <div className="flex-1 overflow-y-auto p-4" onClick={() => setShowEmojiFor(null)}>
           {messages.length === 0 && (
             <div className="text-center text-bat-muted text-sm py-8">
               Welcome to <span className="text-bat-accent">#{activeChannel?.name}</span>.
@@ -502,17 +550,13 @@ export default function AppLayout({ session }: Props) {
                       {msg.edited_at && <span className="ml-1">(edited)</span>}
                     </span>
                   </div>
+
                   {isEditing ? (
                     <div className="mt-1 flex gap-2">
-                      <input
-                        value={editContent}
-                        onChange={e => setEditContent(e.target.value)}
+                      <input value={editContent} onChange={e => setEditContent(e.target.value)}
                         className="flex-1 bg-bat-elevated border border-bat-border rounded px-2 py-1 text-sm outline-none focus:border-bat-accent"
                         autoFocus
-                        onKeyDown={e => {
-                          if (e.key === 'Enter') saveEdit(msg.id)
-                          if (e.key === 'Escape') cancelEdit()
-                        }}
+                        onKeyDown={e => { if (e.key === 'Enter') saveEdit(msg.id); if (e.key === 'Escape') cancelEdit() }}
                       />
                       <button onClick={() => saveEdit(msg.id)} className="text-xs text-bat-accent font-medium">Save</button>
                       <button onClick={cancelEdit} className="text-xs text-bat-muted">Cancel</button>
@@ -520,10 +564,33 @@ export default function AppLayout({ session }: Props) {
                   ) : (
                     <div className="text-bat-text text-[15px] leading-relaxed break-words">{msg.content}</div>
                   )}
+
+                  {msg.reactions && msg.reactions.length > 0 && (
+                    <div className="flex flex-wrap gap-1 mt-1.5">
+                      {msg.reactions.map(r => (
+                        <button
+                          key={r.emoji}
+                          onClick={() => toggleReaction(msg.id, r.emoji)}
+                          className={`inline-flex items-center gap-1 px-1.5 py-0.5 rounded-full text-xs border transition ${
+                            r.users?.includes(session.user.id)
+                              ? 'bg-bat-accent/20 border-bat-accent/40 text-bat-accent'
+                              : 'bg-bat-elevated border-bat-border text-bat-muted hover:border-bat-muted'
+                          }`}
+                        >
+                          <span>{r.emoji}</span>
+                          <span>{r.count || 1}</span>
+                        </button>
+                      ))}
+                    </div>
+                  )}
                 </div>
 
                 {!isEditing && (
-                  <div className="absolute right-0 top-0 opacity-0 group-hover:opacity-100 transition flex gap-0.5 bg-bat-surface border border-bat-border rounded-lg p-0.5 shadow">
+                  <div className="absolute right-0 top-0 opacity-0 group-hover:opacity-100 transition flex gap-0.5 bg-bat-surface border border-bat-border rounded-lg p-0.5 shadow z-10">
+                    <button onClick={(e) => { e.stopPropagation(); setShowEmojiFor(showEmojiFor === msg.id ? null : msg.id) }}
+                      className="p-1.5 rounded hover:bg-bat-elevated text-bat-muted hover:text-bat-text" title="React">
+                      <Smile size={14} />
+                    </button>
                     <button onClick={() => startReply(msg)} className="p-1.5 rounded hover:bg-bat-elevated text-bat-muted hover:text-bat-text" title="Reply">
                       <Reply size={14} />
                     </button>
@@ -539,9 +606,29 @@ export default function AppLayout({ session }: Props) {
                     )}
                   </div>
                 )}
+
+                {showEmojiFor === msg.id && (
+                  <div className="absolute right-0 top-8 bg-bat-surface border border-bat-border rounded-lg p-1.5 flex gap-1 shadow-lg z-20"
+                    onClick={e => e.stopPropagation()}>
+                    {QUICK_EMOJIS.map(emoji => (
+                      <button key={emoji} onClick={() => toggleReaction(msg.id, emoji)}
+                        className="w-8 h-8 flex items-center justify-center rounded hover:bg-bat-elevated text-lg">
+                        {emoji}
+                      </button>
+                    ))}
+                  </div>
+                )}
               </div>
             )
           })}
+
+          {typingUsers.length > 0 && (
+            <div className="text-sm text-bat-muted italic px-1 py-2">
+              {typingUsers.length === 1
+                ? `${typingUsers[0]} is typing...`
+                : `${typingUsers.slice(0, 2).join(', ')}${typingUsers.length > 2 ? ' and others' : ''} are typing...`}
+            </div>
+          )}
           <div ref={messagesEndRef} />
         </div>
 
@@ -562,19 +649,19 @@ export default function AppLayout({ session }: Props) {
               ref={inputRef}
               type="text"
               value={newMessage}
-              onChange={e => setNewMessage(e.target.value)}
-              placeholder={replyingTo ? `Reply...` : `Message #${activeChannel?.name || 'channel'}`}
+              onChange={handleInputChange}
+              placeholder={replyingTo ? 'Reply...' : `Message #${activeChannel?.name || 'channel'}`}
               className="flex-1 bg-transparent outline-none text-bat-text placeholder:text-bat-muted"
               autoComplete="off"
             />
-            <button type="submit" disabled={!newMessage.trim() || sending} className="p-1.5 rounded-lg bg-bat-accent text-black disabled:opacity-40 hover:bg-bat-accentHover transition">
+            <button type="submit" disabled={!newMessage.trim() || sending}
+              className="p-1.5 rounded-lg bg-bat-accent text-black disabled:opacity-40 hover:bg-bat-accentHover transition">
               <Send size={16} />
             </button>
           </div>
         </form>
       </div>
 
-      {/* Members */}
       <div className="w-52 bg-bat-surface border-l border-bat-border hidden md:flex flex-col">
         <div className="h-12 px-4 flex items-center border-b border-bat-border">
           <Users size={16} className="text-bat-muted mr-2" />
@@ -590,7 +677,9 @@ export default function AppLayout({ session }: Props) {
                 <div className="w-8 h-8 rounded-full bg-bat-accent/20 flex items-center justify-center text-bat-accent text-sm font-medium">
                   {m.username[0]?.toUpperCase()}
                 </div>
-                <span className={`absolute bottom-0 right-0 w-2.5 h-2.5 rounded-full border-2 border-bat-surface ${m.status === 'online' ? 'bg-bat-success' : 'bg-bat-muted'}`}></span>
+                <span className={`absolute bottom-0 right-0 w-2.5 h-2.5 rounded-full border-2 border-bat-surface ${
+                  m.status === 'online' ? 'bg-bat-success' : 'bg-bat-muted'
+                }`}></span>
               </div>
               <span className="text-sm truncate">{m.username}</span>
             </div>
