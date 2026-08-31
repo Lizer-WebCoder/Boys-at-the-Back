@@ -73,7 +73,6 @@ export default function AppLayout({ session }: Props) {
   const avatarInputRef = useRef<HTMLInputElement>(null)
   const username = session.user.user_metadata?.username || 'User'
 
-  // Always ensure our profile row exists
   const ensureProfile = async () => {
     const { data } = await supabase.from('profiles').select('id, username, avatar_url').eq('id', session.user.id).maybeSingle()
     if (!data) {
@@ -97,13 +96,11 @@ export default function AppLayout({ session }: Props) {
       setActiveChannelId(prev => prev || channelData[0].id)
     }
 
-    // Load members - try join, fallback without
     const { data: memberData } = await supabase
       .from('group_members').select('user_id, profiles(id, username, avatar_url, status)').eq('group_id', gId)
 
     if (memberData) {
       let profiles = memberData.map((m: any) => m.profiles).filter(Boolean) as Profile[]
-      // If join failed, load profiles manually
       if (profiles.length === 0 && memberData.length > 0) {
         const ids = memberData.map((m: any) => m.user_id)
         const { data: prows } = await supabase.from('profiles').select('id, username, avatar_url, status').in('id', ids)
@@ -137,7 +134,6 @@ export default function AppLayout({ session }: Props) {
   useEffect(() => {
     async function init() {
       await ensureProfile()
-
       const { data: groups } = await supabase.from('groups').select('*').limit(1)
       if (!groups?.length) {
         const code = Math.random().toString(36).substring(2, 10).toUpperCase()
@@ -181,15 +177,11 @@ export default function AppLayout({ session }: Props) {
     if (!activeChannelId || needsInvite || viewMode !== 'channel') return
 
     async function loadMessages() {
-      // Simple select first (more reliable)
       const { data, error } = await supabase.from('messages')
         .select('id, content, author_id, created_at, edited_at, reply_to, image_url')
         .eq('channel_id', activeChannelId).order('created_at', { ascending: true }).limit(150)
+      if (error || !data) return
 
-      if (error) { console.error('load messages', error); return }
-      if (!data) return
-
-      // Attach profiles
       const authorIds = [...new Set(data.map(m => m.author_id).filter(Boolean))]
       const { data: prows } = await supabase.from('profiles').select('id, username, avatar_url').in('id', authorIds)
       const pmap: Record<string, any> = {}
@@ -201,7 +193,6 @@ export default function AppLayout({ session }: Props) {
         reactions: [] as Reaction[]
       }))
 
-      // Reactions
       if (enriched.length) {
         const { data: reacts } = await supabase.from('reactions').select('message_id, emoji, user_id').in('message_id', enriched.map(m => m.id))
         const rmap: Record<string, Reaction[]> = {}
@@ -213,7 +204,6 @@ export default function AppLayout({ session }: Props) {
         })
         enriched.forEach(m => { m.reactions = rmap[m.id] || [] })
       }
-
       setMessages(enriched)
     }
     loadMessages()
@@ -221,16 +211,10 @@ export default function AppLayout({ session }: Props) {
     const ch = supabase.channel(`msg:${activeChannelId}`)
       .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'messages', filter: `channel_id=eq.${activeChannelId}` }, async (payload) => {
         const n = payload.new as any
-        // Skip if we already have this id (from our own send)
         setMessages(prev => {
           if (prev.some(m => m.id === n.id)) return prev
-          // Replace any temp message from same author with similar content
           const withoutTemp = prev.filter(m => !(m.id.startsWith('temp-') && m.author_id === n.author_id && m.content === n.content))
-          return [...withoutTemp, {
-            ...n,
-            profiles: { username, avatar_url: myAvatar },
-            reactions: []
-          }]
+          return [...withoutTemp, { ...n, profiles: { username, avatar_url: myAvatar }, reactions: [] }]
         })
       })
       .on('postgres_changes', { event: 'UPDATE', schema: 'public', table: 'messages', filter: `channel_id=eq.${activeChannelId}` }, (payload) => {
@@ -284,8 +268,17 @@ export default function AppLayout({ session }: Props) {
   const startDm = async (other: Profile) => {
     if (!other?.id || other.id === session.user.id) return
     try {
-      // Find existing
-      const { data: myParts } = await supabase.from('dm_participants').select('conversation_id').eq('user_id', session.user.id)
+      await ensureProfile()
+
+      // Find existing conversation
+      const { data: myParts, error: partsErr } = await supabase
+        .from('dm_participants').select('conversation_id').eq('user_id', session.user.id)
+
+      if (partsErr) {
+        alert('DM error (load): ' + partsErr.message)
+        return
+      }
+
       if (myParts) {
         for (const p of myParts) {
           const { data: match } = await supabase.from('dm_participants')
@@ -298,29 +291,39 @@ export default function AppLayout({ session }: Props) {
           }
         }
       }
+
       // Create new conversation
-      const { data: convo, error: cErr } = await supabase.from('dm_conversations').insert({}).select().single()
-      if (cErr || !convo) {
-        console.error('DM create error', cErr)
-        alert('Could not start DM. Make sure you ran the latest schema.sql')
+      const { data: convo, error: cErr } = await supabase
+        .from('dm_conversations')
+        .insert({})
+        .select('id')
+        .single()
+
+      if (cErr) {
+        alert('DM create error: ' + cErr.message + (cErr.details ? '\n' + cErr.details : '') + (cErr.hint ? '\n' + cErr.hint : ''))
         return
       }
+      if (!convo) {
+        alert('DM create returned empty. Table may be missing.')
+        return
+      }
+
       const { error: pErr } = await supabase.from('dm_participants').insert([
         { conversation_id: convo.id, user_id: session.user.id },
         { conversation_id: convo.id, user_id: other.id }
       ])
+
       if (pErr) {
-        console.error('DM participants error', pErr)
-        alert('Could not start DM: ' + pErr.message)
+        alert('DM participants error: ' + pErr.message + (pErr.details ? '\n' + pErr.details : ''))
         return
       }
+
       setActiveDmId(convo.id)
       setDmOther(other)
       setViewMode('dm')
       await loadDms()
     } catch (err: any) {
-      console.error(err)
-      alert('DM error: ' + (err.message || 'unknown'))
+      alert('DM exception: ' + (err?.message || String(err)))
     }
   }
 
@@ -357,9 +360,7 @@ export default function AppLayout({ session }: Props) {
   const sendMessage = async (e?: React.FormEvent) => {
     e?.preventDefault()
     if ((!newMessage.trim() && !pendingImage) || sending) return
-
     await ensureProfile()
-
     setSending(true)
     const content = newMessage.trim()
     const imageUrl = pendingImage
@@ -378,7 +379,6 @@ export default function AppLayout({ session }: Props) {
         .insert({ conversation_id: activeDmId, author_id: session.user.id, content: content || null, image_url: imageUrl })
         .select('id, content, author_id, created_at, image_url').single()
       if (error) {
-        console.error('DM send error', error)
         alert('Failed to send: ' + error.message)
         setDmMessages(prev => prev.filter(m => m.id !== tempId))
         setNewMessage(content)
@@ -393,29 +393,16 @@ export default function AppLayout({ session }: Props) {
         reply_message: replyingTo ? { id: replyingTo.id, content: replyingTo.content, profiles: replyingTo.profiles } : null,
         reactions: []
       }])
-
       const { data, error } = await supabase.from('messages')
-        .insert({
-          channel_id: activeChannelId,
-          author_id: session.user.id,
-          content: content || null,
-          image_url: imageUrl || null,
-          reply_to: replyId
-        })
-        .select('id, content, author_id, created_at, reply_to, image_url')
-        .single()
-
+        .insert({ channel_id: activeChannelId, author_id: session.user.id, content: content || null, image_url: imageUrl || null, reply_to: replyId })
+        .select('id, content, author_id, created_at, reply_to, image_url').single()
       if (error) {
-        console.error('Send error', error)
         alert('Failed to send: ' + error.message)
         setMessages(prev => prev.filter(m => m.id !== tempId))
         setNewMessage(content)
         if (imageUrl) setPendingImage(imageUrl)
       } else if (data) {
-        setMessages(prev => prev.map(m => m.id === tempId
-          ? { ...data, profiles: { username, avatar_url: myAvatar }, reactions: [] }
-          : m
-        ))
+        setMessages(prev => prev.map(m => m.id === tempId ? { ...data, profiles: { username, avatar_url: myAvatar }, reactions: [] } : m))
       }
     }
     setSending(false)
@@ -506,7 +493,6 @@ export default function AppLayout({ session }: Props) {
         <div className="h-12 px-4 flex items-center border-b border-bat-border shadow-sm">
           <h2 className="font-semibold text-sm tracking-wide">Boys at the Back</h2>
         </div>
-
         <div className="flex-1 overflow-y-auto p-2">
           <div className="text-xs font-semibold text-bat-muted uppercase px-2 mb-1 tracking-wider">Text Channels</div>
           {channels.map(ch => (
@@ -522,7 +508,6 @@ export default function AppLayout({ session }: Props) {
               )}
             </button>
           ))}
-
           <div className="text-xs font-semibold text-bat-muted uppercase px-2 mt-4 mb-1 tracking-wider">Direct Messages</div>
           {dmConvos.length === 0 && <p className="text-[11px] text-bat-muted px-2">Click a member → start DM</p>}
           {dmConvos.map(dm => (
@@ -535,10 +520,8 @@ export default function AppLayout({ session }: Props) {
               <span className="flex-1 text-left truncate">{dm.other.username}</span>
             </button>
           ))}
-
           <div className="text-xs font-semibold text-bat-muted uppercase px-2 mt-4 mb-1 tracking-wider">Voice (Phase 2)</div>
           <div className="px-2 py-1.5 text-sm text-bat-muted flex items-center gap-2 opacity-50"><Mic size={16} /> Lounge</div>
-
           <div className="mt-6 px-2">
             <div className="text-xs font-semibold text-bat-muted uppercase mb-1 tracking-wider">Invite Code</div>
             <div className="flex items-center gap-1 bg-bat-elevated rounded-lg px-2 py-1.5">
@@ -550,7 +533,6 @@ export default function AppLayout({ session }: Props) {
             </div>
           </div>
         </div>
-
         <div className="h-14 bg-bat-elevated border-t border-bat-border px-2 flex items-center gap-2">
           <button onClick={() => avatarInputRef.current?.click()} title="Change avatar" className="relative group">
             <Avatar name={username} url={myAvatar} size="sm" />
@@ -575,14 +557,12 @@ export default function AppLayout({ session }: Props) {
             <><Hash size={18} className="text-bat-muted mr-2" /><span className="font-semibold">{activeChannel?.name || 'general'}</span></>
           )}
         </div>
-
         <div className="flex-1 overflow-y-auto p-4" onClick={() => setShowEmojiFor(null)}>
           {displayMessages.length === 0 && (
             <div className="text-center text-bat-muted text-sm py-8">
               {viewMode === 'dm' ? 'Start the conversation!' : <>Welcome to <span className="text-bat-accent">#{activeChannel?.name}</span></>}
             </div>
           )}
-
           {displayMessages.map((msg) => {
             const isOwn = msg.author_id === session.user.id
             const isEditing = editingId === msg.id
@@ -655,9 +635,7 @@ export default function AppLayout({ session }: Props) {
             )
           })}
           {viewMode === 'channel' && typingUsers.length > 0 && (
-            <div className="text-sm text-bat-muted italic px-1 py-2">
-              {typingUsers[0]} is typing...
-            </div>
+            <div className="text-sm text-bat-muted italic px-1 py-2">{typingUsers[0]} is typing...</div>
           )}
           <div ref={messagesEndRef} />
         </div>
@@ -717,12 +695,6 @@ export default function AppLayout({ session }: Props) {
               <span className="text-sm truncate">{m.username || 'User'}</span>
             </button>
           ))}
-          {members.length === 0 && (
-            <div className="flex items-center gap-2 px-1 py-1.5">
-              <Avatar name={username} url={myAvatar} size="sm" />
-              <span className="text-sm">{username}</span>
-            </div>
-          )}
         </div>
       </div>
     </div>
