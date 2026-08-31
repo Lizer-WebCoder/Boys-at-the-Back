@@ -1,6 +1,6 @@
 import { Session } from '@supabase/supabase-js'
 import { useState, useEffect, useRef, useCallback } from 'react'
-import { Hash, Users, LogOut, Mic, Send, Pencil, Trash2, Reply, X, Copy, Check, Smile } from 'lucide-react'
+import { Hash, Users, LogOut, Mic, Send, Pencil, Trash2, Reply, X, Copy, Check, Smile, ImagePlus } from 'lucide-react'
 import { supabase } from '../lib/supabase'
 import { format } from 'date-fns'
 
@@ -28,6 +28,7 @@ interface Message {
   created_at: string
   edited_at?: string | null
   reply_to?: string | null
+  image_url?: string | null
   profiles?: { username: string; avatar_url: string | null } | null
   reply_message?: { id: string; content: string; profiles?: { username: string } | null } | null
   reactions?: Reaction[]
@@ -41,6 +42,18 @@ interface Profile {
 }
 
 const QUICK_EMOJIS = ['👍', '❤️', '😂', '🔥', '👀', '🎉']
+
+function renderContent(text: string) {
+  if (!text) return null
+  const parts = text.split(/(@\w+)/g)
+  return parts.map((part, i) =>
+    part.startsWith('@') ? (
+      <span key={i} className="text-bat-accent font-medium bg-bat-accent/10 px-0.5 rounded">{part}</span>
+    ) : (
+      <span key={i}>{part}</span>
+    )
+  )
+}
 
 export default function AppLayout({ session }: Props) {
   const [channels, setChannels] = useState<Channel[]>([])
@@ -62,8 +75,11 @@ export default function AppLayout({ session }: Props) {
   const [copied, setCopied] = useState(false)
   const [typingUsers, setTypingUsers] = useState<string[]>([])
   const [showEmojiFor, setShowEmojiFor] = useState<string | null>(null)
+  const [uploading, setUploading] = useState(false)
+  const [pendingImage, setPendingImage] = useState<string | null>(null)
   const messagesEndRef = useRef<HTMLDivElement>(null)
   const inputRef = useRef<HTMLInputElement>(null)
+  const fileInputRef = useRef<HTMLInputElement>(null)
   const typingTimeout = useRef<ReturnType<typeof setTimeout> | null>(null)
   const username = session.user.user_metadata?.username || 'User'
 
@@ -199,14 +215,14 @@ export default function AppLayout({ session }: Props) {
     async function loadMessages() {
       const { data, error } = await supabase
         .from('messages')
-        .select(`id, content, author_id, created_at, edited_at, reply_to, profiles!author_id (username, avatar_url)`)
+        .select(`id, content, author_id, created_at, edited_at, reply_to, image_url, profiles!author_id (username, avatar_url)`)
         .eq('channel_id', activeChannelId)
         .order('created_at', { ascending: true })
         .limit(150)
 
       if (error) {
         const { data: simple } = await supabase
-          .from('messages').select('id, content, author_id, created_at, edited_at, reply_to')
+          .from('messages').select('id, content, author_id, created_at, edited_at, reply_to, image_url')
           .eq('channel_id', activeChannelId).order('created_at', { ascending: true }).limit(150)
         if (simple) setMessages(simple as any)
         return
@@ -314,6 +330,32 @@ export default function AppLayout({ session }: Props) {
     typingTimeout.current = setTimeout(() => {}, 2000)
   }
 
+  const handleImageSelect = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0]
+    if (!file || !file.type.startsWith('image/')) return
+    if (file.size > 5 * 1024 * 1024) {
+      alert('Image must be under 5MB')
+      return
+    }
+
+    setUploading(true)
+    const ext = file.name.split('.').pop()
+    const path = `${session.user.id}/${Date.now()}.${ext}`
+
+    const { error } = await supabase.storage.from('chat-images').upload(path, file)
+    if (error) {
+      console.error(error)
+      alert('Upload failed: ' + error.message)
+      setUploading(false)
+      return
+    }
+
+    const { data: urlData } = supabase.storage.from('chat-images').getPublicUrl(path)
+    setPendingImage(urlData.publicUrl)
+    setUploading(false)
+    if (fileInputRef.current) fileInputRef.current.value = ''
+  }
+
   const toggleReaction = async (messageId: string, emoji: string) => {
     if (messageId.startsWith('temp-')) return
     setShowEmojiFor(null)
@@ -359,11 +401,13 @@ export default function AppLayout({ session }: Props) {
 
   const sendMessage = async (e?: React.FormEvent) => {
     e?.preventDefault()
-    if (!newMessage.trim() || !activeChannelId || sending) return
+    if ((!newMessage.trim() && !pendingImage) || !activeChannelId || sending) return
 
     setSending(true)
     const content = newMessage.trim()
+    const imageUrl = pendingImage
     setNewMessage('')
+    setPendingImage(null)
     const replyId = replyingTo?.id || null
     setReplyingTo(null)
 
@@ -371,6 +415,7 @@ export default function AppLayout({ session }: Props) {
     setMessages(prev => [...prev, {
       id: tempId, content, author_id: session.user.id,
       created_at: new Date().toISOString(),
+      image_url: imageUrl,
       profiles: { username, avatar_url: null },
       reply_to: replyId,
       reply_message: replyingTo ? { id: replyingTo.id, content: replyingTo.content, profiles: replyingTo.profiles } : null,
@@ -379,12 +424,20 @@ export default function AppLayout({ session }: Props) {
 
     const { data, error } = await supabase
       .from('messages')
-      .insert({ channel_id: activeChannelId, author_id: session.user.id, content, reply_to: replyId })
-      .select('id, content, author_id, created_at, reply_to').single()
+      .insert({
+        channel_id: activeChannelId,
+        author_id: session.user.id,
+        content: content || null,
+        image_url: imageUrl,
+        reply_to: replyId
+      })
+      .select('id, content, author_id, created_at, reply_to, image_url').single()
 
     if (error) {
+      console.error(error)
       setMessages(prev => prev.filter(m => m.id !== tempId))
       setNewMessage(content)
+      setPendingImage(imageUrl)
     } else if (data) {
       setMessages(prev => prev.map(m => m.id === tempId
         ? { ...data, profiles: { username, avatar_url: null }, reply_message: replyingTo ? { id: replyingTo.id, content: replyingTo.content, profiles: replyingTo.profiles } : null, reactions: [] }
@@ -393,7 +446,7 @@ export default function AppLayout({ session }: Props) {
     setSending(false)
   }
 
-  const startEdit = (msg: Message) => { setEditingId(msg.id); setEditContent(msg.content) }
+  const startEdit = (msg: Message) => { setEditingId(msg.id); setEditContent(msg.content || '') }
   const cancelEdit = () => { setEditingId(null); setEditContent('') }
 
   const saveEdit = async (id: string) => {
@@ -562,7 +615,21 @@ export default function AppLayout({ session }: Props) {
                       <button onClick={cancelEdit} className="text-xs text-bat-muted">Cancel</button>
                     </div>
                   ) : (
-                    <div className="text-bat-text text-[15px] leading-relaxed break-words">{msg.content}</div>
+                    <>
+                      {msg.content && (
+                        <div className="text-bat-text text-[15px] leading-relaxed break-words">
+                          {renderContent(msg.content)}
+                        </div>
+                      )}
+                      {msg.image_url && (
+                        <img
+                          src={msg.image_url}
+                          alt="uploaded"
+                          className="mt-2 max-w-xs max-h-64 rounded-lg border border-bat-border cursor-pointer hover:opacity-90"
+                          onClick={() => window.open(msg.image_url!, '_blank')}
+                        />
+                      )}
+                    </>
                   )}
 
                   {msg.reactions && msg.reactions.length > 0 && (
@@ -643,18 +710,46 @@ export default function AppLayout({ session }: Props) {
           </div>
         )}
 
+        {pendingImage && (
+          <div className="mx-4 mb-1 relative inline-block">
+            <img src={pendingImage} alt="preview" className="h-20 rounded-lg border border-bat-border" />
+            <button
+              onClick={() => setPendingImage(null)}
+              className="absolute -top-2 -right-2 w-5 h-5 bg-bat-danger rounded-full flex items-center justify-center text-white text-xs"
+            >
+              <X size={12} />
+            </button>
+          </div>
+        )}
+
         <form onSubmit={sendMessage} className="p-4 pt-0">
-          <div className={`bg-bat-elevated rounded-xl px-4 py-3 flex items-center gap-3 border border-bat-border ${replyingTo ? 'rounded-t-none' : ''}`}>
+          <div className={`bg-bat-elevated rounded-xl px-4 py-3 flex items-center gap-3 border border-bat-border ${replyingTo || pendingImage ? 'rounded-t-none' : ''}`}>
+            <input
+              type="file"
+              ref={fileInputRef}
+              accept="image/*"
+              className="hidden"
+              onChange={handleImageSelect}
+            />
+            <button
+              type="button"
+              onClick={() => fileInputRef.current?.click()}
+              disabled={uploading}
+              className="p-1.5 rounded hover:bg-bat-border text-bat-muted hover:text-bat-text transition disabled:opacity-40"
+              title="Upload image"
+            >
+              <ImagePlus size={18} />
+            </button>
             <input
               ref={inputRef}
               type="text"
               value={newMessage}
               onChange={handleInputChange}
-              placeholder={replyingTo ? 'Reply...' : `Message #${activeChannel?.name || 'channel'}`}
+              placeholder={replyingTo ? 'Reply...' : `Message #${activeChannel?.name || 'channel'} (try @username)`}
               className="flex-1 bg-transparent outline-none text-bat-text placeholder:text-bat-muted"
               autoComplete="off"
             />
-            <button type="submit" disabled={!newMessage.trim() || sending}
+            <button type="submit" disabled={(!newMessage.trim() && !pendingImage) || sending || uploading}
               className="p-1.5 rounded-lg bg-bat-accent text-black disabled:opacity-40 hover:bg-bat-accentHover transition">
               <Send size={16} />
             </button>
@@ -675,13 +770,13 @@ export default function AppLayout({ session }: Props) {
             <div key={m.id} className="flex items-center gap-2 px-1 py-1.5 rounded hover:bg-bat-elevated/50">
               <div className="relative">
                 <div className="w-8 h-8 rounded-full bg-bat-accent/20 flex items-center justify-center text-bat-accent text-sm font-medium">
-                  {m.username[0]?.toUpperCase()}
+                  {(m.username || '?')[0]?.toUpperCase()}
                 </div>
                 <span className={`absolute bottom-0 right-0 w-2.5 h-2.5 rounded-full border-2 border-bat-surface ${
                   m.status === 'online' ? 'bg-bat-success' : 'bg-bat-muted'
                 }`}></span>
               </div>
-              <span className="text-sm truncate">{m.username}</span>
+              <span className="text-sm truncate">{m.username || 'User'}</span>
             </div>
           ))}
         </div>
